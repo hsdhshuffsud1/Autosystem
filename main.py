@@ -44,7 +44,6 @@ class MyClient(discord.Client):
         if not DATABASE_URL:
             raise RuntimeError("DATABASE_URL 환경 변수를 설정해 주세요.")
 
-        # Railway의 postgres:// 주소를 asyncpg 연결 형식으로 변환합니다.
         database_url = DATABASE_URL.replace("postgres://", "postgresql://", 1)
         self.db = await asyncpg.create_pool(database_url)
 
@@ -59,10 +58,19 @@ class MyClient(discord.Client):
                 )
             """)
 
-            # 이미 존재하는 테이블에도 컬럼을 추가합니다.
+            # 기존 데이터베이스에도 Roblox ID 컬럼을 추가합니다.
             await connection.execute("""
                 ALTER TABLE registrations
                 ADD COLUMN IF NOT EXISTS roblox_id BIGINT
+            """)
+
+            await connection.execute("""
+                CREATE TABLE IF NOT EXISTS rank_roles (
+                    guild_id BIGINT NOT NULL,
+                    rank_name TEXT NOT NULL,
+                    role_id BIGINT NOT NULL,
+                    PRIMARY KEY (guild_id, rank_name)
+                )
             """)
 
         await self.tree.sync()
@@ -71,7 +79,81 @@ class MyClient(discord.Client):
 client = MyClient()
 
 
-@client.tree.command(name="등록", description="디스코드와 로블록스 정보를 등록합니다")
+# /직급 역할등록 명령어 그룹
+rank_group = app_commands.Group(
+    name="직급",
+    description="직급별 서버 역할을 등록합니다",
+)
+
+
+@rank_group.command(
+    name="역할등록",
+    description="직급에 연결할 서버 역할을 등록합니다",
+)
+@app_commands.rename(
+    rank="직급",
+    role="역할",
+)
+@app_commands.choices(
+    rank=[
+        app_commands.Choice(name="인턴", value="인턴"),
+        app_commands.Choice(name="사원", value="사원"),
+        app_commands.Choice(name="주임", value="주임"),
+        app_commands.Choice(name="대리", value="대리"),
+        app_commands.Choice(name="과장", value="과장"),
+        app_commands.Choice(name="차장", value="차장"),
+        app_commands.Choice(name="부장", value="부장"),
+        app_commands.Choice(name="이사", value="이사"),
+        app_commands.Choice(name="부대표", value="부대표"),
+        app_commands.Choice(name="대표", value="대표"),
+    ]
+)
+async def register_rank_role(
+    interaction: discord.Interaction,
+    rank: app_commands.Choice[str],
+    role: discord.Role,
+):
+    if interaction.guild_id is None:
+        await interaction.response.send_message(
+            "이 명령어는 서버 안에서만 사용할 수 있어요.",
+            ephemeral=True,
+        )
+        return
+
+    if not interaction.user.guild_permissions.manage_roles:
+        await interaction.response.send_message(
+            "역할을 등록하려면 역할 관리 권한이 필요해요.",
+            ephemeral=True,
+        )
+        return
+
+    async with client.db.acquire() as connection:
+        await connection.execute(
+            """
+            INSERT INTO rank_roles (guild_id, rank_name, role_id)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (guild_id, rank_name)
+            DO UPDATE SET role_id = EXCLUDED.role_id
+            """,
+            interaction.guild_id,
+            rank.value,
+            role.id,
+        )
+
+    await interaction.response.send_message(
+        f"직급 **{rank.value}**에 역할 {role.mention}을 등록했어요.",
+        ephemeral=True,
+    )
+
+
+client.tree.add_command(rank_group)
+
+
+# /등록 명령어
+@client.tree.command(
+    name="등록",
+    description="디스코드와 로블록스 정보를 등록합니다",
+)
 @app_commands.rename(
     discord_account="디스코드",
     roblox_nickname="로블록스",
@@ -94,7 +176,6 @@ async def register(
         )
         return
 
-    # Roblox 계정 확인 중 Discord 응답이 시간 초과되지 않게 합니다.
     await interaction.response.defer(ephemeral=True)
 
     try:
@@ -113,7 +194,6 @@ async def register(
         )
         return
 
-    # Roblox에서 확인된 정식 사용자 이름과 고유 ID를 저장합니다.
     roblox_name = roblox_user["name"]
     roblox_key = roblox_name.casefold()
     roblox_id = int(roblox_user["id"])
@@ -166,7 +246,6 @@ async def register(
                 roblox_id,
             )
         except asyncpg.UniqueViolationError:
-            # 거의 동시에 같은 계정이 등록된 경우에도 중복 저장을 막습니다.
             existing = await connection.fetch(
                 """
                 SELECT discord_id, discord_name, roblox_name
@@ -220,9 +299,15 @@ async def register(
     )
 
 
-@client.tree.command(name="정보", description="등록된 Roblox 계정 정보를 확인합니다")
+# /정보 명령어
+@client.tree.command(
+    name="정보",
+    description="등록된 Roblox 계정 정보를 확인합니다",
+)
 @app_commands.rename(member="디스코드")
-@app_commands.describe(member="정보를 확인할 디스코드 계정을 선택하세요")
+@app_commands.describe(
+    member="정보를 확인할 디스코드 계정을 선택하세요",
+)
 async def info(
     interaction: discord.Interaction,
     member: discord.Member,
@@ -248,7 +333,7 @@ async def info(
 
         roblox_id = row["roblox_id"]
 
-        # 예전에 등록해 roblox_id가 없는 데이터는 조회해서 보완합니다.
+        # 이전 등록 데이터에 Roblox ID가 없으면 조회해서 데이터베이스를 보완합니다.
         if roblox_id is None:
             try:
                 roblox_user = await find_roblox_user(row["roblox_name"])
