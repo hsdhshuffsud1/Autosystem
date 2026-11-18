@@ -15,6 +15,20 @@ intents = discord.Intents.default()
 intents.message_content = True
 
 
+RANK_CHOICES = [
+    app_commands.Choice(name="인턴", value="인턴"),
+    app_commands.Choice(name="사원", value="사원"),
+    app_commands.Choice(name="주임", value="주임"),
+    app_commands.Choice(name="대리", value="대리"),
+    app_commands.Choice(name="과장", value="과장"),
+    app_commands.Choice(name="차장", value="차장"),
+    app_commands.Choice(name="부장", value="부장"),
+    app_commands.Choice(name="이사", value="이사"),
+    app_commands.Choice(name="부대표", value="부대표"),
+    app_commands.Choice(name="대표", value="대표"),
+]
+
+
 async def find_roblox_user(username: str):
     """Roblox 사용자 이름으로 계정을 조회합니다."""
     url = "https://users.roblox.com/v1/usernames/users"
@@ -32,6 +46,28 @@ async def find_roblox_user(username: str):
 
     users = result.get("data", [])
     return users[0] if users else None
+
+
+def make_duplicate_embed(rows):
+    embed = discord.Embed(
+        title="이미 등록된 계정입니다.",
+        color=discord.Color.orange(),
+    )
+
+    for row in rows:
+        rank_name = row["rank_name"] or "미등록"
+        embed.add_field(
+            name="등록 정보",
+            value=(
+                f"디스코드: <@{row['discord_id']}> "
+                f"({row['discord_name']})\n"
+                f"로블록스: {row['roblox_name']}\n"
+                f"직급: {rank_name}"
+            ),
+            inline=False,
+        )
+
+    return embed
 
 
 class MyClient(discord.Client):
@@ -54,14 +90,19 @@ class MyClient(discord.Client):
                     discord_name TEXT NOT NULL,
                     roblox_name TEXT NOT NULL,
                     roblox_key TEXT NOT NULL UNIQUE,
-                    roblox_id BIGINT
+                    roblox_id BIGINT,
+                    rank_name TEXT
                 )
             """)
 
-            # 기존 데이터베이스에도 Roblox ID 컬럼을 추가합니다.
+            # 기존 테이블에도 새 컬럼을 추가합니다.
             await connection.execute("""
                 ALTER TABLE registrations
                 ADD COLUMN IF NOT EXISTS roblox_id BIGINT
+            """)
+            await connection.execute("""
+                ALTER TABLE registrations
+                ADD COLUMN IF NOT EXISTS rank_name TEXT
             """)
 
             await connection.execute("""
@@ -90,24 +131,8 @@ rank_group = app_commands.Group(
     name="역할등록",
     description="직급에 연결할 서버 역할을 등록합니다",
 )
-@app_commands.rename(
-    rank="직급",
-    role="역할",
-)
-@app_commands.choices(
-    rank=[
-        app_commands.Choice(name="인턴", value="인턴"),
-        app_commands.Choice(name="사원", value="사원"),
-        app_commands.Choice(name="주임", value="주임"),
-        app_commands.Choice(name="대리", value="대리"),
-        app_commands.Choice(name="과장", value="과장"),
-        app_commands.Choice(name="차장", value="차장"),
-        app_commands.Choice(name="부장", value="부장"),
-        app_commands.Choice(name="이사", value="이사"),
-        app_commands.Choice(name="부대표", value="부대표"),
-        app_commands.Choice(name="대표", value="대표"),
-    ]
-)
+@app_commands.rename(rank="직급", role="역할")
+@app_commands.choices(rank=RANK_CHOICES)
 async def register_rank_role(
     interaction: discord.Interaction,
     rank: app_commands.Choice[str],
@@ -157,15 +182,19 @@ client.tree.add_command(rank_group)
 @app_commands.rename(
     discord_account="디스코드",
     roblox_nickname="로블록스",
+    rank="직급",
 )
 @app_commands.describe(
     discord_account="등록할 디스코드 계정을 선택하세요",
     roblox_nickname="Roblox 사용자 이름을 입력하세요",
+    rank="등록할 직급을 선택하세요",
 )
+@app_commands.choices(rank=RANK_CHOICES)
 async def register(
     interaction: discord.Interaction,
     discord_account: discord.Member,
     roblox_nickname: str,
+    rank: app_commands.Choice[str],
 ):
     roblox_name = roblox_nickname.strip()
 
@@ -197,11 +226,12 @@ async def register(
     roblox_name = roblox_user["name"]
     roblox_key = roblox_name.casefold()
     roblox_id = int(roblox_user["id"])
+    rank_name = rank.value
 
     async with client.db.acquire() as connection:
         existing = await connection.fetch(
             """
-            SELECT discord_id, discord_name, roblox_name
+            SELECT discord_id, discord_name, roblox_name, rank_name
             FROM registrations
             WHERE discord_id = $1 OR roblox_key = $2
             """,
@@ -210,24 +240,8 @@ async def register(
         )
 
         if existing:
-            embed = discord.Embed(
-                title="이미 등록된 계정입니다.",
-                color=discord.Color.orange(),
-            )
-
-            for row in existing:
-                embed.add_field(
-                    name="등록 정보",
-                    value=(
-                        f"디스코드: <@{row['discord_id']}> "
-                        f"({row['discord_name']})\n"
-                        f"로블록스: {row['roblox_name']}"
-                    ),
-                    inline=False,
-                )
-
             await interaction.followup.send(
-                embed=embed,
+                embed=make_duplicate_embed(existing),
                 ephemeral=True,
             )
             return
@@ -236,47 +250,79 @@ async def register(
             await connection.execute(
                 """
                 INSERT INTO registrations
-                    (discord_id, discord_name, roblox_name, roblox_key, roblox_id)
-                VALUES ($1, $2, $3, $4, $5)
+                    (
+                        discord_id,
+                        discord_name,
+                        roblox_name,
+                        roblox_key,
+                        roblox_id,
+                        rank_name
+                    )
+                VALUES ($1, $2, $3, $4, $5, $6)
                 """,
                 discord_account.id,
                 str(discord_account),
                 roblox_name,
                 roblox_key,
                 roblox_id,
+                rank_name,
             )
         except asyncpg.UniqueViolationError:
             existing = await connection.fetch(
                 """
-                SELECT discord_id, discord_name, roblox_name
+                SELECT discord_id, discord_name, roblox_name, rank_name
                 FROM registrations
                 WHERE discord_id = $1 OR roblox_key = $2
                 """,
                 discord_account.id,
                 roblox_key,
             )
-
-            embed = discord.Embed(
-                title="이미 등록된 계정입니다.",
-                color=discord.Color.orange(),
-            )
-
-            for row in existing:
-                embed.add_field(
-                    name="등록 정보",
-                    value=(
-                        f"디스코드: <@{row['discord_id']}> "
-                        f"({row['discord_name']})\n"
-                        f"로블록스: {row['roblox_name']}"
-                    ),
-                    inline=False,
-                )
-
             await interaction.followup.send(
-                embed=embed,
+                embed=make_duplicate_embed(existing),
                 ephemeral=True,
             )
             return
+
+        # 이 직급에 연결된 역할이 있으면 ID를 가져옵니다.
+        role_id = None
+        if interaction.guild_id is not None:
+            role_id = await connection.fetchval(
+                """
+                SELECT role_id
+                FROM rank_roles
+                WHERE guild_id = $1 AND rank_name = $2
+                """,
+                interaction.guild_id,
+                rank_name,
+            )
+
+    # 디스코드 별명을 "(직급) (로블닉)" 형식으로 변경합니다.
+    nickname = f"({rank_name}) ({roblox_name})"
+    nickname_updated = False
+
+    try:
+        await discord_account.edit(
+            nick=nickname,
+            reason="봇 등록 명령어로 별명 설정",
+        )
+        nickname_updated = True
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
+    # 등록된 직급 역할이 있으면 해당 역할을 부여합니다.
+    role_updated = False
+    if role_id is not None and interaction.guild is not None:
+        role = interaction.guild.get_role(role_id)
+
+        if role is not None:
+            try:
+                await discord_account.add_roles(
+                    role,
+                    reason=f"{rank_name} 직급 등록",
+                )
+                role_updated = True
+            except (discord.Forbidden, discord.HTTPException):
+                pass
 
     embed = discord.Embed(
         title="등록 처리 완료",
@@ -292,6 +338,35 @@ async def register(
         value=roblox_name,
         inline=False,
     )
+    embed.add_field(
+        name="직급",
+        value=rank_name,
+        inline=False,
+    )
+
+    result_lines = []
+
+    if nickname_updated:
+        result_lines.append(f"별명을 `{nickname}`으로 변경했어요.")
+    else:
+        result_lines.append(
+            "DB에는 등록했지만 별명을 바꾸지 못했어요. "
+            "봇의 별명 관리 권한과 역할 위치를 확인해 주세요."
+        )
+
+    if role_id is None:
+        result_lines.append(
+            "이 직급에 연결된 서버 역할이 없어 역할은 부여하지 않았어요."
+        )
+    elif role_updated:
+        result_lines.append("직급 역할도 부여했어요.")
+    else:
+        result_lines.append(
+            "직급 역할을 부여하지 못했어요. "
+            "봇의 역할 관리 권한과 역할 위치를 확인해 주세요."
+        )
+
+    embed.description = "\n".join(result_lines)
 
     await interaction.followup.send(
         embed=embed,
@@ -302,7 +377,7 @@ async def register(
 # /정보 명령어
 @client.tree.command(
     name="정보",
-    description="등록된 Roblox 계정 정보를 확인합니다",
+    description="등록된 계정 정보를 확인합니다",
 )
 @app_commands.rename(member="디스코드")
 @app_commands.describe(
@@ -317,7 +392,7 @@ async def info(
     async with client.db.acquire() as connection:
         row = await connection.fetchrow(
             """
-            SELECT discord_id, roblox_name, roblox_id
+            SELECT discord_id, roblox_name, roblox_id, rank_name
             FROM registrations
             WHERE discord_id = $1
             """,
@@ -333,7 +408,7 @@ async def info(
 
         roblox_id = row["roblox_id"]
 
-        # 이전 등록 데이터에 Roblox ID가 없으면 조회해서 데이터베이스를 보완합니다.
+        # 예전에 등록된 데이터에 Roblox ID가 없다면 찾아서 저장합니다.
         if roblox_id is None:
             try:
                 roblox_user = await find_roblox_user(row["roblox_name"])
@@ -364,10 +439,12 @@ async def info(
             )
 
     profile_url = f"https://www.roblox.com/users/{roblox_id}/profile"
+    rank_name = row["rank_name"] or "미등록"
 
     await interaction.followup.send(
-        f"{member.mention}의 Roblox 계정: "
-        f"[{row['roblox_name']}]({profile_url})",
+        f"디스코드: {member.mention}\n"
+        f"직급: {rank_name}\n"
+        f"로블록스: [{row['roblox_name']}]({profile_url})",
         ephemeral=True,
     )
 
