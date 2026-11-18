@@ -1,5 +1,6 @@
 import os
 
+import aiohttp
 import asyncpg
 import discord
 from discord import app_commands
@@ -14,6 +15,25 @@ intents = discord.Intents.default()
 intents.message_content = True
 
 
+async def find_roblox_user(username: str):
+    """Roblox 사용자 이름으로 계정을 조회합니다."""
+    url = "https://users.roblox.com/v1/usernames/users"
+    payload = {
+        "usernames": [username],
+        "excludeBannedUsers": False,
+    }
+
+    timeout = aiohttp.ClientTimeout(total=10)
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(url, json=payload) as response:
+            response.raise_for_status()
+            result = await response.json()
+
+    users = result.get("data", [])
+    return users[0] if users else None
+
+
 class MyClient(discord.Client):
     def __init__(self):
         super().__init__(intents=intents)
@@ -24,7 +44,7 @@ class MyClient(discord.Client):
         if not DATABASE_URL:
             raise RuntimeError("DATABASE_URL 환경 변수를 설정해 주세요.")
 
-        # Railway에서 제공하는 postgres:// 주소도 연결할 수 있도록 변환
+        # Railway의 postgres:// 주소를 asyncpg가 사용하는 형식으로 변환
         database_url = DATABASE_URL.replace("postgres://", "postgresql://", 1)
         self.db = await asyncpg.create_pool(database_url)
 
@@ -50,8 +70,8 @@ client = MyClient()
     roblox_nickname="로블록스",
 )
 @app_commands.describe(
-    discord_account="등록할 디스코드 계정을 멘션으로 선택하세요",
-    roblox_nickname="로블록스 닉네임을 입력하세요",
+    discord_account="등록할 디스코드 계정을 선택하세요",
+    roblox_nickname="Roblox 사용자 이름을 입력하세요",
 )
 async def register(
     interaction: discord.Interaction,
@@ -59,14 +79,36 @@ async def register(
     roblox_nickname: str,
 ):
     roblox_name = roblox_nickname.strip()
-    roblox_key = roblox_name.casefold()
 
     if not roblox_name:
         await interaction.response.send_message(
-            "로블록스 닉네임을 입력해 주세요.",
+            "로블록스 사용자 이름을 입력해 주세요.",
             ephemeral=True,
         )
         return
+
+    # Roblox API 확인 중에 Discord 응답 시간이 초과되지 않게 먼저 응답합니다.
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        roblox_user = await find_roblox_user(roblox_name)
+    except (aiohttp.ClientError, TimeoutError):
+        await interaction.followup.send(
+            "Roblox 계정 확인에 실패했어요. 잠시 후 다시 시도해 주세요.",
+            ephemeral=True,
+        )
+        return
+
+    if roblox_user is None:
+        await interaction.followup.send(
+            "존재하지 않는 Roblox 사용자 이름입니다. 다시 확인해 주세요.",
+            ephemeral=True,
+        )
+        return
+
+    # 입력한 이름 대신 Roblox에서 확인된 정식 사용자 이름을 저장합니다.
+    roblox_name = roblox_user["name"]
+    roblox_key = roblox_name.casefold()
 
     async with client.db.acquire() as connection:
         existing = await connection.fetch(
@@ -85,7 +127,7 @@ async def register(
                 color=discord.Color.orange(),
             )
 
-            for index, row in enumerate(existing, start=1):
+            for row in existing:
                 embed.add_field(
                     name="등록 정보",
                     value=(
@@ -96,7 +138,7 @@ async def register(
                     inline=False,
                 )
 
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 embed=embed,
                 ephemeral=True,
             )
@@ -115,9 +157,35 @@ async def register(
                 roblox_key,
             )
         except asyncpg.UniqueViolationError:
-            # 거의 동시에 같은 계정이 등록된 경우에도 중복 등록을 막습니다.
-            await interaction.response.send_message(
-                "이미 등록된 계정입니다. 다시 확인해 주세요.",
+            # 동시에 같은 계정을 등록하는 상황에서 중복 저장을 막습니다.
+            existing = await connection.fetch(
+                """
+                SELECT discord_id, discord_name, roblox_name
+                FROM registrations
+                WHERE discord_id = $1 OR roblox_key = $2
+                """,
+                discord_account.id,
+                roblox_key,
+            )
+
+            embed = discord.Embed(
+                title="이미 등록된 계정입니다.",
+                color=discord.Color.orange(),
+            )
+
+            for row in existing:
+                embed.add_field(
+                    name="등록 정보",
+                    value=(
+                        f"디스코드: <@{row['discord_id']}> "
+                        f"({row['discord_name']})\n"
+                        f"로블록스: {row['roblox_name']}"
+                    ),
+                    inline=False,
+                )
+
+            await interaction.followup.send(
+                embed=embed,
                 ephemeral=True,
             )
             return
@@ -126,10 +194,21 @@ async def register(
         title="등록 처리 완료",
         color=discord.Color.green(),
     )
-    embed.add_field(name="디스코드", value=discord_account.mention, inline=False)
-    embed.add_field(name="로블록스", value=roblox_name, inline=False)
+    embed.add_field(
+        name="디스코드",
+        value=discord_account.mention,
+        inline=False,
+    )
+    embed.add_field(
+        name="로블록스",
+        value=roblox_name,
+        inline=False,
+    )
 
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await interaction.followup.send(
+        embed=embed,
+        ephemeral=True,
+    )
 
 
 @client.event
@@ -147,6 +226,6 @@ async def on_message(message: discord.Message):
 
 
 if not TOKEN:
-    raise RuntimeError(".env 또는 Railway Variables에 DISCORD_TOKEN을 설정해 주세요.")
+    raise RuntimeError("DISCORD_TOKEN을 설정해 주세요.")
 
 client.run(TOKEN)
