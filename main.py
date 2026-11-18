@@ -44,7 +44,7 @@ class MyClient(discord.Client):
         if not DATABASE_URL:
             raise RuntimeError("DATABASE_URL 환경 변수를 설정해 주세요.")
 
-        # Railway의 postgres:// 주소를 asyncpg가 사용하는 형식으로 변환
+        # Railway의 postgres:// 주소를 asyncpg 연결 형식으로 변환합니다.
         database_url = DATABASE_URL.replace("postgres://", "postgresql://", 1)
         self.db = await asyncpg.create_pool(database_url)
 
@@ -54,8 +54,15 @@ class MyClient(discord.Client):
                     discord_id BIGINT PRIMARY KEY,
                     discord_name TEXT NOT NULL,
                     roblox_name TEXT NOT NULL,
-                    roblox_key TEXT NOT NULL UNIQUE
+                    roblox_key TEXT NOT NULL UNIQUE,
+                    roblox_id BIGINT
                 )
+            """)
+
+            # 이미 존재하는 테이블에도 컬럼을 추가합니다.
+            await connection.execute("""
+                ALTER TABLE registrations
+                ADD COLUMN IF NOT EXISTS roblox_id BIGINT
             """)
 
         await self.tree.sync()
@@ -87,7 +94,7 @@ async def register(
         )
         return
 
-    # Roblox API 확인 중에 Discord 응답 시간이 초과되지 않게 먼저 응답합니다.
+    # Roblox 계정 확인 중 Discord 응답이 시간 초과되지 않게 합니다.
     await interaction.response.defer(ephemeral=True)
 
     try:
@@ -106,9 +113,10 @@ async def register(
         )
         return
 
-    # 입력한 이름 대신 Roblox에서 확인된 정식 사용자 이름을 저장합니다.
+    # Roblox에서 확인된 정식 사용자 이름과 고유 ID를 저장합니다.
     roblox_name = roblox_user["name"]
     roblox_key = roblox_name.casefold()
+    roblox_id = int(roblox_user["id"])
 
     async with client.db.acquire() as connection:
         existing = await connection.fetch(
@@ -148,16 +156,17 @@ async def register(
             await connection.execute(
                 """
                 INSERT INTO registrations
-                    (discord_id, discord_name, roblox_name, roblox_key)
-                VALUES ($1, $2, $3, $4)
+                    (discord_id, discord_name, roblox_name, roblox_key, roblox_id)
+                VALUES ($1, $2, $3, $4, $5)
                 """,
                 discord_account.id,
                 str(discord_account),
                 roblox_name,
                 roblox_key,
+                roblox_id,
             )
         except asyncpg.UniqueViolationError:
-            # 동시에 같은 계정을 등록하는 상황에서 중복 저장을 막습니다.
+            # 거의 동시에 같은 계정이 등록된 경우에도 중복 저장을 막습니다.
             existing = await connection.fetch(
                 """
                 SELECT discord_id, discord_name, roblox_name
@@ -207,6 +216,73 @@ async def register(
 
     await interaction.followup.send(
         embed=embed,
+        ephemeral=True,
+    )
+
+
+@client.tree.command(name="정보", description="등록된 Roblox 계정 정보를 확인합니다")
+@app_commands.rename(member="디스코드")
+@app_commands.describe(member="정보를 확인할 디스코드 계정을 선택하세요")
+async def info(
+    interaction: discord.Interaction,
+    member: discord.Member,
+):
+    await interaction.response.defer(ephemeral=True)
+
+    async with client.db.acquire() as connection:
+        row = await connection.fetchrow(
+            """
+            SELECT discord_id, roblox_name, roblox_id
+            FROM registrations
+            WHERE discord_id = $1
+            """,
+            member.id,
+        )
+
+        if row is None:
+            await interaction.followup.send(
+                "등록된 정보가 없습니다.",
+                ephemeral=True,
+            )
+            return
+
+        roblox_id = row["roblox_id"]
+
+        # 예전에 등록해 roblox_id가 없는 데이터는 조회해서 보완합니다.
+        if roblox_id is None:
+            try:
+                roblox_user = await find_roblox_user(row["roblox_name"])
+            except (aiohttp.ClientError, TimeoutError):
+                await interaction.followup.send(
+                    "Roblox 계정 확인에 실패했어요. 잠시 후 다시 시도해 주세요.",
+                    ephemeral=True,
+                )
+                return
+
+            if roblox_user is None:
+                await interaction.followup.send(
+                    "저장된 Roblox 계정을 찾을 수 없습니다.",
+                    ephemeral=True,
+                )
+                return
+
+            roblox_id = int(roblox_user["id"])
+
+            await connection.execute(
+                """
+                UPDATE registrations
+                SET roblox_id = $1
+                WHERE discord_id = $2
+                """,
+                roblox_id,
+                member.id,
+            )
+
+    profile_url = f"https://www.roblox.com/users/{roblox_id}/profile"
+
+    await interaction.followup.send(
+        f"{member.mention}의 Roblox 계정: "
+        f"[{row['roblox_name']}]({profile_url})",
         ephemeral=True,
     )
 
