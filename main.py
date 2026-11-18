@@ -87,7 +87,7 @@ async def register(
 
             for index, row in enumerate(existing, start=1):
                 embed.add_field(
-                    name=f"등록 정보 {index}",
+                    name="등록 정보",
                     value=(
                         f"디스코드: <@{row['discord_id']}> "
                         f"({row['discord_name']})\n"
