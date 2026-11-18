@@ -11,9 +11,8 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
+# 이제 채팅 메시지 내용을 읽지 않으므로 Message Content Intent는 필요 없습니다.
 intents = discord.Intents.default()
-intents.message_content = True
-
 
 RANK_CHOICES = [
     app_commands.Choice(name="인턴", value="인턴"),
@@ -70,6 +69,88 @@ def make_duplicate_embed(rows):
     return embed
 
 
+async def update_member_rank_roles(
+    guild: discord.Guild,
+    member: discord.Member,
+    rank_name: str,
+    roblox_name: str,
+):
+    """DB에 등록된 직급 역할을 적용하고 디스코드 별명을 변경합니다."""
+    async with client.db.acquire() as connection:
+        role_rows = await connection.fetch(
+            """
+            SELECT rank_name, role_id
+            FROM rank_roles
+            WHERE guild_id = $1
+            """,
+            guild.id,
+        )
+
+    role_ids_by_rank = {
+        row["rank_name"]: row["role_id"]
+        for row in role_rows
+    }
+    all_rank_role_ids = set(role_ids_by_rank.values())
+    new_role_id = role_ids_by_rank.get(rank_name)
+
+    role_message = ""
+    old_roles = [
+        role
+        for role in member.roles
+        if role.id in all_rank_role_ids and role.id != new_role_id
+    ]
+
+    try:
+        if old_roles:
+            await member.remove_roles(
+                *old_roles,
+                reason=f"직급을 {rank_name}(으)로 변경",
+            )
+
+        if new_role_id is None:
+            role_message = "이 직급에 등록된 역할이 없어 역할은 추가하지 않았어요."
+        else:
+            new_role = guild.get_role(new_role_id)
+
+            if new_role is None:
+                role_message = (
+                    "등록된 직급 역할을 서버에서 찾을 수 없어 역할을 추가하지 못했어요."
+                )
+            elif new_role not in member.roles:
+                await member.add_roles(
+                    new_role,
+                    reason=f"{rank_name} 직급 적용",
+                )
+                role_message = f"{new_role.mention} 역할을 적용했어요."
+            else:
+                role_message = f"{new_role.mention} 역할이 이미 적용되어 있어요."
+
+    except discord.Forbidden:
+        role_message = (
+            "역할을 변경하지 못했어요. 봇에 역할 관리 권한을 주고 "
+            "봇 역할을 대상 역할보다 위로 옮겨 주세요."
+        )
+    except discord.HTTPException:
+        role_message = "Discord 역할 변경 중 오류가 발생했어요."
+
+    nickname = f"{rank_name} {roblox_name}"
+
+    try:
+        await member.edit(
+            nick=nickname,
+            reason=f"{rank_name} 직급 정보 적용",
+        )
+        nickname_message = f"별명을 `{nickname}`으로 변경했어요."
+    except discord.Forbidden:
+        nickname_message = (
+            "별명을 변경하지 못했어요. 봇에 별명 관리 권한이 있는지 확인해 주세요."
+        )
+    except discord.HTTPException:
+        nickname_message = "Discord 별명 변경 중 오류가 발생했어요."
+
+    return nickname_message, role_message
+
+
 class MyClient(discord.Client):
     def __init__(self):
         super().__init__(intents=intents)
@@ -95,7 +176,7 @@ class MyClient(discord.Client):
                 )
             """)
 
-            # 기존 테이블에도 새 컬럼을 추가합니다.
+            # 기존 테이블을 사용하는 경우에도 새 컬럼을 추가합니다.
             await connection.execute("""
                 ALTER TABLE registrations
                 ADD COLUMN IF NOT EXISTS roblox_id BIGINT
@@ -120,10 +201,10 @@ class MyClient(discord.Client):
 client = MyClient()
 
 
-# /직급 역할등록 명령어 그룹
+# /직급 명령어 그룹
 rank_group = app_commands.Group(
     name="직급",
-    description="직급별 서버 역할을 등록합니다",
+    description="직급과 역할을 관리합니다",
 )
 
 
@@ -171,13 +252,85 @@ async def register_rank_role(
     )
 
 
+@rank_group.command(
+    name="관리",
+    description="등록된 사용자의 직급과 역할을 변경합니다",
+)
+@app_commands.rename(member="대상", rank="직급")
+@app_commands.choices(rank=RANK_CHOICES)
+async def manage_rank(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    rank: app_commands.Choice[str],
+):
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "이 명령어는 서버 안에서만 사용할 수 있어요.",
+            ephemeral=True,
+        )
+        return
+
+    if not interaction.user.guild_permissions.manage_roles:
+        await interaction.response.send_message(
+            "직급을 관리하려면 역할 관리 권한이 필요해요.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    async with client.db.acquire() as connection:
+        row = await connection.fetchrow(
+            """
+            SELECT roblox_name
+            FROM registrations
+            WHERE discord_id = $1
+            """,
+            member.id,
+        )
+
+        if row is None:
+            await interaction.followup.send(
+                "이 디스코드 계정은 등록되어 있지 않아 직급을 변경할 수 없어요.",
+                ephemeral=True,
+            )
+            return
+
+        await connection.execute(
+            """
+            UPDATE registrations
+            SET rank_name = $1
+            WHERE discord_id = $2
+            """,
+            rank.value,
+            member.id,
+        )
+
+    nickname_message, role_message = await update_member_rank_roles(
+        guild=interaction.guild,
+        member=member,
+        rank_name=rank.value,
+        roblox_name=row["roblox_name"],
+    )
+
+    embed = discord.Embed(
+        title="직급 변경 완료",
+        color=discord.Color.blue(),
+    )
+    embed.add_field(name="대상", value=member.mention, inline=False)
+    embed.add_field(name="새 직급", value=rank.value, inline=False)
+    embed.description = f"{nickname_message}\n{role_message}"
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
 client.tree.add_command(rank_group)
 
 
 # /등록 명령어
 @client.tree.command(
     name="등록",
-    description="디스코드와 로블록스 정보를 등록합니다",
+    description="디스코드, 로블록스 계정과 직급을 등록합니다",
 )
 @app_commands.rename(
     discord_account="디스코드",
@@ -283,46 +436,12 @@ async def register(
             )
             return
 
-        # 이 직급에 연결된 역할이 있으면 ID를 가져옵니다.
-        role_id = None
-        if interaction.guild_id is not None:
-            role_id = await connection.fetchval(
-                """
-                SELECT role_id
-                FROM rank_roles
-                WHERE guild_id = $1 AND rank_name = $2
-                """,
-                interaction.guild_id,
-                rank_name,
-            )
-
-    # 디스코드 별명을 "(직급) (로블닉)" 형식으로 변경합니다.
-    nickname = f"({rank_name}) ({roblox_name})"
-    nickname_updated = False
-
-    try:
-        await discord_account.edit(
-            nick=nickname,
-            reason="봇 등록 명령어로 별명 설정",
-        )
-        nickname_updated = True
-    except (discord.Forbidden, discord.HTTPException):
-        pass
-
-    # 등록된 직급 역할이 있으면 해당 역할을 부여합니다.
-    role_updated = False
-    if role_id is not None and interaction.guild is not None:
-        role = interaction.guild.get_role(role_id)
-
-        if role is not None:
-            try:
-                await discord_account.add_roles(
-                    role,
-                    reason=f"{rank_name} 직급 등록",
-                )
-                role_updated = True
-            except (discord.Forbidden, discord.HTTPException):
-                pass
+    nickname_message, role_message = await update_member_rank_roles(
+        guild=interaction.guild,
+        member=discord_account,
+        rank_name=rank_name,
+        roblox_name=roblox_name,
+    )
 
     embed = discord.Embed(
         title="등록 처리 완료",
@@ -343,35 +462,9 @@ async def register(
         value=rank_name,
         inline=False,
     )
+    embed.description = f"{nickname_message}\n{role_message}"
 
-    result_lines = []
-
-    if nickname_updated:
-        result_lines.append(f"별명을 `{nickname}`으로 변경했어요.")
-    else:
-        result_lines.append(
-            "DB에는 등록했지만 별명을 바꾸지 못했어요. "
-            "봇의 별명 관리 권한과 역할 위치를 확인해 주세요."
-        )
-
-    if role_id is None:
-        result_lines.append(
-            "이 직급에 연결된 서버 역할이 없어 역할은 부여하지 않았어요."
-        )
-    elif role_updated:
-        result_lines.append("직급 역할도 부여했어요.")
-    else:
-        result_lines.append(
-            "직급 역할을 부여하지 못했어요. "
-            "봇의 역할 관리 권한과 역할 위치를 확인해 주세요."
-        )
-
-    embed.description = "\n".join(result_lines)
-
-    await interaction.followup.send(
-        embed=embed,
-        ephemeral=True,
-    )
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 # /정보 명령어
@@ -408,7 +501,7 @@ async def info(
 
         roblox_id = row["roblox_id"]
 
-        # 예전에 등록된 데이터에 Roblox ID가 없다면 찾아서 저장합니다.
+        # 이전에 등록된 데이터에 Roblox ID가 없으면 찾아서 보완합니다.
         if roblox_id is None:
             try:
                 roblox_user = await find_roblox_user(row["roblox_name"])
@@ -439,28 +532,29 @@ async def info(
             )
 
     profile_url = f"https://www.roblox.com/users/{roblox_id}/profile"
-    rank_name = row["rank_name"] or "미등록"
 
-    await interaction.followup.send(
-        f"디스코드: {member.mention}\n"
-        f"직급: {rank_name}\n"
-        f"로블록스: [{row['roblox_name']}]({profile_url})",
-        ephemeral=True,
+    embed = discord.Embed(
+        title="등록 정보",
+        color=discord.Color.blue(),
     )
+    embed.add_field(name="디스코드", value=member.mention, inline=False)
+    embed.add_field(
+        name="직급",
+        value=row["rank_name"] or "미등록",
+        inline=False,
+    )
+    embed.add_field(
+        name="로블록스",
+        value=f"[{row['roblox_name']}]({profile_url})",
+        inline=False,
+    )
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 @client.event
 async def on_ready():
     print(f"로그인 완료: {client.user}")
-
-
-@client.event
-async def on_message(message: discord.Message):
-    if message.author.bot:
-        return
-
-    if message.content.strip() == "안녕":
-        await message.reply("안녕하세요")
 
 
 if not TOKEN:
